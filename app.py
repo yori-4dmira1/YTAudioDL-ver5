@@ -20,6 +20,7 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import runtime
 
@@ -37,6 +38,51 @@ PROGRESS_TEMPLATE = (
 )
 PROG_RE = re.compile(r"^PROG\|")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _has_explicit_video_id(url: str) -> bool:
+    """URLが特定の1本の動画を指しているか(=動画IDを含むか)を判定する。
+
+    True の場合は単体動画として list/index を取り除ける。
+    False の場合(例: youtube.com/playlist?list=...)は動画IDが無いため、
+    単体動画に変換しようがなく、再生リストとして扱うしかない。
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return True  # 解析できない場合は安全側(単体動画扱い)にしておく
+    host = p.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = p.path
+
+    if host == "youtu.be":
+        return bool(path.strip("/"))
+    if "youtube.com" in host:
+        if path.startswith(("/shorts/", "/embed/", "/live/", "/v/")):
+            return True
+        if path == "/watch":
+            qs = parse_qs(p.query)
+            return bool(qs.get("v", [""])[0])
+        return False  # /playlist など動画IDを含まないパス
+    return True  # YouTube以外のURLはそのまま単体として扱う
+
+
+def _strip_playlist_params(url: str) -> str:
+    """list= / index= / start_radio= を取り除き、動画1本だけを指すURLにする。
+
+    これにより、再生リストの途中で開いた動画や「ミックスリスト」内の動画でも、
+    yt-dlp が再生リスト/ミックスの展開処理に入らず常に単体動画として扱える。
+    """
+    try:
+        p = urlparse(url)
+        qs = parse_qs(p.query)
+        for key in ("list", "index", "start_radio", "pp"):
+            qs.pop(key, None)
+        new_query = urlencode({k: v[0] for k, v in qs.items()})
+        return urlunparse(p._replace(query=new_query))
+    except Exception:
+        return url
 
 
 # ==========================================================================
@@ -122,6 +168,7 @@ class App(tk.Tk):
         self.proc: subprocess.Popen | None = None
         self.cancelled = False
         self.cfg = runtime.load_config()
+        self._run_token = 0
 
         self._build_ui()
         self.after(100, self._poll)
@@ -188,7 +235,11 @@ class App(tk.Tk):
 
         ttk.Label(
             frm,
-            text="※オフの場合、URLに &list=... が含まれていてもその動画1本だけを取得します。",
+            text=(
+                "※オフでも、動画IDを含まない再生リストURL（例: .../playlist?list=...）は\n"
+                "自動的に全曲ダウンロードします。動画1本のURLに &list=... が付いている場合は\n"
+                "その動画1本だけを取得します（ミックスリストも同様）。"
+            ),
             foreground="#777", font=("", 8), wraplength=580, justify="left",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
@@ -223,14 +274,38 @@ class App(tk.Tk):
         win = SetupWindow(self)
         self.wait_window(win)
 
+    # ---------- URL の前処理 ----------
+    def _prepare_urls(self, raw_urls: list[str]) -> tuple[list[str], bool]:
+        """チェックボックスの状態とURLの種類に応じて、実際に渡すURLと
+        再生リストとして扱うかどうかを決める。
+
+        - チェックがオンなら全URLをそのまま渡し、再生リスト展開を有効にする。
+        - チェックがオフでも、動画IDを含まない純粋な再生リストURLは
+          単体動画に変換しようがないため、そのURLに限り再生リストとして扱う。
+        - チェックがオフで動画IDがあるURL(ミックスリスト内の動画を含む)は、
+          list/index パラメータを取り除いて確実に単体動画として扱う。
+        """
+        if self.playlist_mode.get():
+            return raw_urls, True
+
+        prepared = []
+        force_playlist = False
+        for u in raw_urls:
+            if _has_explicit_video_id(u):
+                prepared.append(_strip_playlist_params(u))
+            else:
+                prepared.append(u)
+                force_playlist = True
+        return prepared, force_playlist
+
     # ---------- 実行 ----------
-    def _args(self, urls: list[str]) -> list[str]:
+    def _args(self, urls: list[str], as_playlist: bool) -> list[str]:
         out = Path(self.out_var.get())
-        # 再生リストのURLでも、通常は末尾の &list=... を無視してその動画1本だけを
-        # 取得する(--no-playlist)。「再生リストとして扱う」がオンの時だけ全曲取得する。
-        playlist_flag = "--yes-playlist" if self.playlist_mode.get() else "--no-playlist"
-        # 再生リスト取得時は動画ごとに連番を付け、単体動画取得時はタイトルのみにする。
-        outtmpl = "%(playlist_index&{}. |)s%(title)s.%(ext)s"
+        playlist_flag = "--yes-playlist" if as_playlist else "--no-playlist"
+        # 再生リスト取得時のみ連番を付け、単体動画取得時はタイトルのみにする。
+        # (playlist_index|)s: 存在すれば実際の番号、無ければ空文字
+        # (playlist_index&. |)s: 存在すれば区切りの ". " のみ、無ければ空文字
+        outtmpl = "%(playlist_index|)s%(playlist_index&. |)s%(title)s.%(ext)s"
         args = [
             str(runtime.YTDLP),
             "--ffmpeg-location", str(runtime.BIN_DIR),
@@ -253,18 +328,26 @@ class App(tk.Tk):
         if not runtime.is_ready():
             messagebox.showwarning("未準備", "コンポーネントの取得が完了していません。")
             return
-        urls = [u.strip() for u in self.urls.get("1.0", "end").splitlines() if u.strip()]
-        if not urls:
+        raw_urls = [u.strip() for u in self.urls.get("1.0", "end").splitlines() if u.strip()]
+        if not raw_urls:
             messagebox.showinfo("URLなし", "URLを入力してください。")
             return
         os.makedirs(self.out_var.get(), exist_ok=True)
         self._save_settings()
 
+        urls, as_playlist = self._prepare_urls(raw_urls)
+
+        self._run_token += 1
         self.cancelled = False
         self.dl_btn["state"] = "disabled"
         self.cancel_btn["state"] = "normal"
         self.bar["value"] = 0
-        threading.Thread(target=self._run, args=(urls,), daemon=True).start()
+        self.status["text"] = (
+            "再生リストを取得しています…" if as_playlist else "取得しています…"
+        )
+        threading.Thread(
+            target=self._run, args=(urls, as_playlist), daemon=True
+        ).start()
 
     def _save_settings(self):
         self.cfg.update({
@@ -280,10 +363,10 @@ class App(tk.Tk):
             runtime.kill_process_tree(self.proc)
         self.destroy()
 
-    def _run(self, urls):
+    def _run(self, urls, as_playlist: bool):
         try:
             self.proc = subprocess.Popen(
-                self._args(urls),
+                self._args(urls, as_playlist),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 bufsize=1, **runtime.no_window_kwargs(),
@@ -345,9 +428,17 @@ class App(tk.Tk):
                     self.cancel_btn["state"] = "disabled"
                     if success:
                         self.urls.delete("1.0", "end")
+                    token = self._run_token
+                    self.after(3000, lambda t=token: self._reset_status_if_idle(t))
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+    def _reset_status_if_idle(self, token: int):
+        # 待っている間に次のダウンロードが始まっていたら(トークンが変わっていたら)
+        # その進捗表示を上書きしないようにする。
+        if token == self._run_token:
+            self.status["text"] = "準備完了"
 
 
 if __name__ == "__main__":
