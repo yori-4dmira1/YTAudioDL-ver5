@@ -25,6 +25,10 @@ import runtime
 
 BITRATES = ["128", "192", "256", "320"]
 AUDIO_FORMAT = "m4a"  # 固定。Windows標準環境で追加コーデック無しに再生・サムネ表示できる形式。
+# YouTube 側が既に m4a/aac で配信している場合はそれを直接使うことで
+# 音声の再エンコードを避け、変換にかかる時間を大幅に短縮する。
+FORMAT_SELECTOR = "bestaudio[ext=m4a]/bestaudio/best"
+CONCURRENT_FRAGMENTS = "4"
 
 # yt-dlp に機械可読な進捗を吐かせるためのテンプレート
 PROGRESS_TEMPLATE = (
@@ -111,16 +115,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("YouTube Audio Downloader")
-        self.geometry("640x420")
+        self.geometry("640x470")
         self.resizable(False, False)
 
         self.q: queue.Queue = queue.Queue()
         self.proc: subprocess.Popen | None = None
         self.cancelled = False
+        self.cfg = runtime.load_config()
 
         self._build_ui()
         self.after(100, self._poll)
         self.after(200, self._setup)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- セットアップ ----------
     def _setup(self):
@@ -151,7 +157,7 @@ class App(tk.Tk):
         self.urls.grid(row=1, column=0, columnspan=4, sticky="we", pady=(2, 10))
 
         ttk.Label(frm, text="保存先").grid(row=2, column=0, sticky="w")
-        self.out_var = tk.StringVar(value=str(Path.home() / "Downloads"))
+        self.out_var = tk.StringVar(value=self.cfg["output_dir"])
         ttk.Entry(frm, textvariable=self.out_var).grid(
             row=2, column=1, columnspan=2, sticky="we", padx=4
         )
@@ -160,7 +166,7 @@ class App(tk.Tk):
         )
 
         ttk.Label(frm, text="音質(kbps)").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        self.br = tk.StringVar(value="192")
+        self.br = tk.StringVar(value=self.cfg["bitrate"])
         self.br_box = ttk.Combobox(frm, textvariable=self.br, values=BITRATES,
                                    state="readonly", width=8)
         self.br_box.grid(row=3, column=1, sticky="w", pady=(10, 0))
@@ -168,19 +174,32 @@ class App(tk.Tk):
             row=3, column=2, columnspan=2, sticky="e", pady=(10, 0)
         )
 
-        self.meta = tk.BooleanVar(value=True)
+        self.meta = tk.BooleanVar(value=self.cfg["embed_metadata"])
         ttk.Checkbutton(
             frm, text="サムネイル画像・曲情報をファイルに埋め込む", variable=self.meta
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        self.playlist_mode = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm,
+            text="再生リストのURLとして扱う（全曲まとめてダウンロード）",
+            variable=self.playlist_mode,
+        ).grid(row=4, column=2, columnspan=2, sticky="e", pady=(10, 0))
+
+        ttk.Label(
+            frm,
+            text="※オフの場合、URLに &list=... が含まれていてもその動画1本だけを取得します。",
+            foreground="#777", font=("", 8), wraplength=580, justify="left",
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
         self.bar = ttk.Progressbar(frm, maximum=100)
-        self.bar.grid(row=5, column=0, columnspan=4, sticky="we", pady=(14, 4))
+        self.bar.grid(row=6, column=0, columnspan=4, sticky="we", pady=(14, 4))
 
         self.status = ttk.Label(frm, text="起動中…", anchor="w", foreground="#444")
-        self.status.grid(row=6, column=0, columnspan=4, sticky="we")
+        self.status.grid(row=7, column=0, columnspan=4, sticky="we")
 
         bar = ttk.Frame(frm)
-        bar.grid(row=7, column=0, columnspan=4, sticky="we", pady=(12, 0))
+        bar.grid(row=8, column=0, columnspan=4, sticky="we", pady=(12, 0))
         ttk.Button(bar, text="コンポーネント再取得", command=self._repair).pack(side="left")
         self.cancel_btn = ttk.Button(bar, text="中止", command=self._cancel,
                                      state="disabled")
@@ -207,13 +226,21 @@ class App(tk.Tk):
     # ---------- 実行 ----------
     def _args(self, urls: list[str]) -> list[str]:
         out = Path(self.out_var.get())
+        # 再生リストのURLでも、通常は末尾の &list=... を無視してその動画1本だけを
+        # 取得する(--no-playlist)。「再生リストとして扱う」がオンの時だけ全曲取得する。
+        playlist_flag = "--yes-playlist" if self.playlist_mode.get() else "--no-playlist"
+        # 再生リスト取得時は動画ごとに連番を付け、単体動画取得時はタイトルのみにする。
+        outtmpl = "%(playlist_index&{}. |)s%(title)s.%(ext)s"
         args = [
             str(runtime.YTDLP),
             "--ffmpeg-location", str(runtime.BIN_DIR),
             "--paths", str(out),
-            "-o", "%(title)s.%(ext)s",
+            "-o", outtmpl,
+            "-f", FORMAT_SELECTOR,
             "-x", "--audio-format", AUDIO_FORMAT,
             "--audio-quality", f"{self.br.get()}K",
+            "--concurrent-fragments", CONCURRENT_FRAGMENTS,
+            playlist_flag,
             "--newline", "--no-colors", "--no-warnings",
             "--progress-template", PROGRESS_TEMPLATE,
             "--ignore-errors",
@@ -231,12 +258,27 @@ class App(tk.Tk):
             messagebox.showinfo("URLなし", "URLを入力してください。")
             return
         os.makedirs(self.out_var.get(), exist_ok=True)
+        self._save_settings()
 
         self.cancelled = False
         self.dl_btn["state"] = "disabled"
         self.cancel_btn["state"] = "normal"
         self.bar["value"] = 0
         threading.Thread(target=self._run, args=(urls,), daemon=True).start()
+
+    def _save_settings(self):
+        self.cfg.update({
+            "output_dir": self.out_var.get(),
+            "bitrate": self.br.get(),
+            "embed_metadata": bool(self.meta.get()),
+        })
+        runtime.save_config(self.cfg)
+
+    def _on_close(self):
+        self._save_settings()
+        if self.proc:
+            runtime.kill_process_tree(self.proc)
+        self.destroy()
 
     def _run(self, urls):
         try:
@@ -245,18 +287,19 @@ class App(tk.Tk):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 bufsize=1, **runtime.no_window_kwargs(),
+                **runtime.process_group_kwargs(),
             )
             for line in self.proc.stdout:
                 self._handle_line(ANSI_RE.sub("", line.strip()))
             code = self.proc.wait()
             if self.cancelled:
-                self.q.put(("done", "中止しました"))
+                self.q.put(("done", "中止しました", False))
             elif code == 0:
-                self.q.put(("done", "完了しました"))
+                self.q.put(("done", "完了しました", True))
             else:
-                self.q.put(("done", f"一部または全部が失敗しました（コード {code}）"))
+                self.q.put(("done", f"一部または全部が失敗しました（コード {code}）", False))
         except Exception as e:
-            self.q.put(("done", f"エラー: {e}"))
+            self.q.put(("done", f"エラー: {e}", False))
         finally:
             self.proc = None
 
@@ -278,9 +321,12 @@ class App(tk.Tk):
 
     def _cancel(self):
         self.cancelled = True
-        if self.proc:
-            self.proc.terminate()
+        self.cancel_btn["state"] = "disabled"
         self.status["text"] = "中止しています…"
+        if self.proc:
+            threading.Thread(
+                target=runtime.kill_process_tree, args=(self.proc,), daemon=True
+            ).start()
 
     def _poll(self):
         try:
@@ -292,10 +338,13 @@ class App(tk.Tk):
                 elif kind == "status":
                     self.status["text"] = rest[0]
                 elif kind == "done":
-                    self.status["text"] = rest[0]
+                    msg, success = rest
+                    self.status["text"] = msg
                     self.bar["value"] = 0
                     self.dl_btn["state"] = "normal"
                     self.cancel_btn["state"] = "disabled"
+                    if success:
+                        self.urls.delete("1.0", "end")
         except queue.Empty:
             pass
         self.after(100, self._poll)
