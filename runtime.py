@@ -74,6 +74,35 @@ YTDLP = _exe("yt-dlp")
 FFMPEG = _exe("ffmpeg")
 FFPROBE = _exe("ffprobe")
 
+CONFIG_FILE = app_dir() / "config.json"
+
+DEFAULT_CONFIG = {
+    "output_dir": str(Path.home() / "Downloads"),
+    "bitrate": "192",
+    "embed_metadata": True,
+}
+
+
+def load_config() -> dict:
+    """前回終了時の設定を読み込む。無ければ既定値を返す。"""
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_FILE.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
 
 def no_window_kwargs() -> dict:
     """Windows でコンソールを一瞬表示させないための起動オプション。"""
@@ -82,6 +111,42 @@ def no_window_kwargs() -> dict:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}
     return {}
+
+
+def process_group_kwargs() -> dict:
+    """子プロセスをまとめて停止できるよう、専用のプロセスグループで起動する。"""
+    if IS_WIN:
+        # CREATE_NO_WINDOW と両立させるため no_window_kwargs 側でまとめて指定する。
+        return {}
+    return {"start_new_session": True}
+
+
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    """子プロセス(ffmpeg等)ごと確実に停止する。
+
+    yt-dlp はダウンロード後に ffmpeg を子プロセスとして起動するため、
+    proc.terminate() だけでは ffmpeg が生き残り、標準出力パイプが
+    閉じずに読み取りループが固まることがある。プロセスツリーごと落とす。
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if IS_WIN:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10, **no_window_kwargs(),
+            )
+        else:
+            import signal
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 # --- 同梱バイナリ ---------------------------------------------------------
