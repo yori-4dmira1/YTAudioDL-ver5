@@ -1,0 +1,37 @@
+name: Build Windows EXE
+
+# 手動実行、または main への push で自動ビルドする。
+# ローカルに Python も Windows も用意する必要はない —
+# GitHub 上の Windows ランナーがビルドを代行する。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "runtime.py"
+      - "build.py"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PyInstaller をインストール
+        run: pip install pyinstaller
+
+      - name: vendor 取得 + ビルド
+        run: python build.py
+
+      - name: 成果物をアップロード
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTAudioDL-windows
+          path: dist/YTAudioDL.exe
+          retention-days: 30
