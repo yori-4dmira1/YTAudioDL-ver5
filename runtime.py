@@ -38,9 +38,12 @@ YTDLP_URL = {
     "linux": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
 }
 FFMPEG_URL = {
-    "win32": "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+    # BtbN の /releases/latest/download/ は「一番新しく公開されたリリース」を指すため、
+    # 日付単位のビルドが公開されるとファイル名が変わり404になる。
+    # 固定タグ "latest" のリリースを直接指すことでこれを回避する。
+    "win32": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
              "ffmpeg-master-latest-win64-gpl.zip",
-    "linux": "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+    "linux": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
              "ffmpeg-master-latest-linux64-gpl.tar.xz",
     "darwin": "https://evermeet.cx/ffmpeg/getrelease/zip",
 }
