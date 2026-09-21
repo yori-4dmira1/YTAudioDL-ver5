@@ -165,6 +165,8 @@ class App(tk.Tk):
         self.resizable(False, False)
 
         self.q: queue.Queue = queue.Queue()
+        self.batch_queue: queue.Queue = queue.Queue()
+        self.worker_running = False
         self.proc: subprocess.Popen | None = None
         self.cancelled = False
         self.cfg = runtime.load_config()
@@ -231,14 +233,25 @@ class App(tk.Tk):
             frm,
             text="再生リストのURLとして扱う（全曲まとめてダウンロード）",
             variable=self.playlist_mode,
-        ).grid(row=4, column=2, columnspan=2, sticky="e", pady=(10, 0))
+        ).grid(row=4, column=2, columnspan=1, sticky="e", pady=(10, 0))
+
+        limit_frm = ttk.Frame(frm)
+        limit_frm.grid(row=4, column=3, sticky="e", pady=(10, 0))
+        ttk.Label(limit_frm, text="上限").pack(side="left")
+        self.playlist_limit = tk.StringVar(value="")
+        vcmd = (self.register(lambda s: s == "" or s.isdigit()), "%P")
+        ttk.Entry(
+            limit_frm, textvariable=self.playlist_limit, width=5,
+            validate="key", validatecommand=vcmd,
+        ).pack(side="left", padx=(4, 0))
 
         ttk.Label(
             frm,
             text=(
                 "※オフでも、動画IDを含まない再生リストURL（例: .../playlist?list=...）は\n"
                 "自動的に全曲ダウンロードします。動画1本のURLに &list=... が付いている場合は\n"
-                "その動画1本だけを取得します（ミックスリストも同様）。"
+                "その動画1本だけを取得します。ミックスリストは開くたびに内容が変わる場合があるため、\n"
+                "「上限」に件数を入れると先頭からその件数だけに絞れます（空欄なら無制限）。"
             ),
             foreground="#777", font=("", 8), wraplength=580, justify="left",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(2, 0))
@@ -299,7 +312,7 @@ class App(tk.Tk):
         return prepared, force_playlist
 
     # ---------- 実行 ----------
-    def _args(self, urls: list[str], as_playlist: bool) -> list[str]:
+    def _args(self, urls: list[str], as_playlist: bool, limit: str) -> list[str]:
         out = Path(self.out_var.get())
         playlist_flag = "--yes-playlist" if as_playlist else "--no-playlist"
         # 再生リスト取得時のみ連番を付け、単体動画取得時はタイトルのみにする。
@@ -320,6 +333,8 @@ class App(tk.Tk):
             "--progress-template", PROGRESS_TEMPLATE,
             "--ignore-errors",
         ]
+        if as_playlist and limit:
+            args += ["--playlist-items", f"1-{limit}"]
         if self.meta.get():
             args += ["--embed-thumbnail", "--embed-metadata"]
         return args + urls
@@ -336,18 +351,36 @@ class App(tk.Tk):
         self._save_settings()
 
         urls, as_playlist = self._prepare_urls(raw_urls)
+        limit = self.playlist_limit.get().strip()
 
-        self._run_token += 1
-        self.cancelled = False
-        self.dl_btn["state"] = "disabled"
+        # ダウンロード中でも次々に追加できるよう、キューに積むだけにする。
+        # 実際の処理はワーカースレッドが順番に取り出して行う。
+        self.batch_queue.put((urls, as_playlist, limit))
+        self.urls.delete("1.0", "end")  # 投入済みなのですぐに欄をクリアする
         self.cancel_btn["state"] = "normal"
-        self.bar["value"] = 0
-        self.status["text"] = (
-            "再生リストを取得しています…" if as_playlist else "取得しています…"
-        )
-        threading.Thread(
-            target=self._run, args=(urls, as_playlist), daemon=True
-        ).start()
+
+        if self.worker_running:
+            self.status["text"] = f"キューに追加しました（待機中の項目あり）"
+        else:
+            self.worker_running = True
+            self.cancelled = False
+            threading.Thread(target=self._worker_loop, daemon=True).start()
+
+    def _worker_loop(self):
+        """キューにある限り、順番にダウンロードを実行し続ける。"""
+        while True:
+            try:
+                urls, as_playlist, limit = self.batch_queue.get_nowait()
+            except queue.Empty:
+                break
+            if self.cancelled:
+                # 中止後に残っていたキューは処理せず破棄する。
+                continue
+            self._run_token += 1
+            self.q.put(("batch_start", as_playlist))
+            self._run_one(urls, as_playlist, limit)
+        self.worker_running = False
+        self.q.put(("queue_empty", None))
 
     def _save_settings(self):
         self.cfg.update({
@@ -363,10 +396,10 @@ class App(tk.Tk):
             runtime.kill_process_tree(self.proc)
         self.destroy()
 
-    def _run(self, urls, as_playlist: bool):
+    def _run_one(self, urls, as_playlist: bool, limit: str):
         try:
             self.proc = subprocess.Popen(
-                self._args(urls, as_playlist),
+                self._args(urls, as_playlist, limit),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 bufsize=1, **runtime.no_window_kwargs(),
@@ -376,13 +409,13 @@ class App(tk.Tk):
                 self._handle_line(ANSI_RE.sub("", line.strip()))
             code = self.proc.wait()
             if self.cancelled:
-                self.q.put(("done", "中止しました", False))
+                self.q.put(("item_done", "中止しました", False))
             elif code == 0:
-                self.q.put(("done", "完了しました", True))
+                self.q.put(("item_done", "完了しました", True))
             else:
-                self.q.put(("done", f"一部または全部が失敗しました（コード {code}）", False))
+                self.q.put(("item_done", f"一部または全部が失敗しました（コード {code}）", False))
         except Exception as e:
-            self.q.put(("done", f"エラー: {e}", False))
+            self.q.put(("item_done", f"エラー: {e}", False))
         finally:
             self.proc = None
 
@@ -406,6 +439,12 @@ class App(tk.Tk):
         self.cancelled = True
         self.cancel_btn["state"] = "disabled"
         self.status["text"] = "中止しています…"
+        # 残っているキュー項目も処理せずに捨てる。
+        try:
+            while True:
+                self.batch_queue.get_nowait()
+        except queue.Empty:
+            pass
         if self.proc:
             threading.Thread(
                 target=runtime.kill_process_tree, args=(self.proc,), daemon=True
@@ -420,14 +459,22 @@ class App(tk.Tk):
                     self.status["text"] = rest[1]
                 elif kind == "status":
                     self.status["text"] = rest[0]
-                elif kind == "done":
+                elif kind == "batch_start":
+                    as_playlist = rest[0]
+                    self.bar["value"] = 0
+                    self.status["text"] = (
+                        "再生リストを取得しています…" if as_playlist else "取得しています…"
+                    )
+                elif kind == "item_done":
                     msg, success = rest
                     self.status["text"] = msg
                     self.bar["value"] = 0
-                    self.dl_btn["state"] = "normal"
+                    if not success and not self.cancelled:
+                        # 失敗しても次のキュー項目があれば続けて処理されるため、
+                        # ここでは表示だけ更新し、URL欄のクリアは行わない。
+                        pass
+                elif kind == "queue_empty":
                     self.cancel_btn["state"] = "disabled"
-                    if success:
-                        self.urls.delete("1.0", "end")
                     token = self._run_token
                     self.after(3000, lambda t=token: self._reset_status_if_idle(t))
         except queue.Empty:
