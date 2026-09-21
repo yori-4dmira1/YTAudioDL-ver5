@@ -16,6 +16,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # Releases を作成・更新するために書き込み権限が必要。
+    permissions:
+      contents: write
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
@@ -32,9 +35,24 @@ jobs:
       - name: vendor 取得 + ビルド
         run: python build.py
 
-      - name: 成果物をアップロード
+      - name: 成果物をアップロード（Actions実行ログ用のバックアップ）
         uses: actions/upload-artifact@v4
         with:
           name: YTAudioDL-windows
           path: dist/YTAudioDL.exe
           retention-days: 30
+
+      # 配布用の本命はこちら。Releases ページに置かれるexeは
+      # GitHubアカウントでログインしていなくてもダウンロードできる
+      # （リポジトリが public の場合。private の場合は招待されたメンバーのみ）。
+      # 常に同じ "latest" タグを更新するので、リンクが毎回変わらない。
+      - name: 最新版として公開
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "YTAudioDL 最新版"
+          body: |
+            ダウンロードすべきファイルは **YTAudioDL.exe** の1つだけです。
+            他のファイルは自動生成されたソースコードのアーカイブなので不要です。
+          files: dist/YTAudioDL.exe
+          make_latest: true
