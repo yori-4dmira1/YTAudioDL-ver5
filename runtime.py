@@ -296,8 +296,12 @@ def update_ytdlp(force: bool = False) -> str:
     if not force and time.time() - last < UPDATE_INTERVAL:
         return "更新確認はスキップ"
     try:
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         r = subprocess.run(
             [str(YTDLP), "-U"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env,
             timeout=120, **no_window_kwargs()
         )
         st["ytdlp_checked"] = time.time()
